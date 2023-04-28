@@ -1,0 +1,240 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(janitor)
+library(lubridate)
+library(ggplot2)
+library(sf)
+```
+
+```{r}
+#Load variables to browse
+acs2020_var <- load_variables(2020, "acs5", cache=TRUE)
+```
+
+```{r}
+#Import cpd data 
+##This is a year's worth of data I pulled back on 9/3/22
+cpd <- read_csv("data/csvexport.csv") %>% clean_names()
+
+#Integrity checks
+cpd %>% 
+  count(address) %>% arrange(desc(n)) #Check Airport Dr address and fix 600 E-XYZ Walnut St
+
+cpd %>% 
+  count(geox) %>% arrange(desc(n))#Simmilar distribution to addresses, which suggests addresses are at least semi-consistently given the correct coordinates
+
+cpd %>% filter(is.na(geox)) #90 rows with NAs in coordinates -- we'll have to exclude. Some don't have addresses some are just vague. We could theoretically fill some of them manually, but it would take a lot of time.
+
+cpd %>% 
+  count(pol_area) %>% arrange(desc(n))
+
+cpd %>% 
+  count(ext_nature_display_name) %>% arrange(desc(n))
+
+cpd %>% 
+  count(dow) %>% arrange(desc(n))
+
+cpd %>% 
+  count(hour)
+```
+
+```{r}
+#Cleaning
+
+#Would need to double check that this is ok to do with CPD...but get rid of duplicates. 
+cpd <- cpd %>% distinct()
+#That got rid of 24 rows. There are still some incident numbers that appear twice but have different information elsewhere. Ask CPD why.
+
+#clean and separate date
+
+#Make new column
+cpd <- cpd %>% 
+  mutate(clean_date_time = call_date_time)
+
+#Set as date using lubridate
+cpd$clean_date_time = mdy_hms(cpd$clean_date_time)
+
+#Separate date from time
+cpd <- cpd %>% 
+  mutate(clean_date = substring(clean_date_time, first = 1, last = (unlist(gregexpr(" ", clean_date_time)))))
+
+#Make sure clean_date is in date format
+cpd$clean_date <- ymd(cpd$clean_date)
+
+cpd %>% count(clean_date) %>% arrange(clean_date)
+
+#Fix the 600 E Walnut street thing -- error in the address column
+cpd <- cpd %>% 
+  mutate(address = replace(address, address == "600-XYZ E WALNUT ST", "600 E WALNUT ST"))
+
+#Remove 600 E Walnut and Airport Rd calls/patrols from data (those are the police stations, not relevant to analysis)
+cpd %>% filter(address != "600 E WALNUT ST", address != "11300 S AIRPORT DR")
+
+#Add call/patrol column -- this is based off what I know from other stories that analyzed 911 calls; would need to check with CPD to make sure it's OK. This is my attempt to break the type of incident down into much broader buckets, for data viz purposes.
+cpd <- cpd %>% 
+  mutate(record_type = ifelse(ext_nature_display_name == "911 CHECKS", "patrol", "call"),
+         record_type = replace(record_type, grepl("traffic", ext_nature_display_name, ignore.case = T), "traffic"))
+```
+
+```{r}
+#Get lon/lat coordinates to cpd df. Right now, the calls are labeled with a CRS I don't know how to use, so I'm going to convert them.
+
+#First, set the sheet as a shapefile -- I have to get rid of NAs in the x and y fields to do that
+cpd_sf <- cpd %>% filter(!is.na(geox))
+
+#Need to double check this CRS with CPD, but it looks normal - spot-check by comparing new geometry column in cpd_sf to geox & geoy in cpd
+cpd_sf <- st_as_sf(cpd_sf, coords = c("geox", "geoy"), crs = "ESRI:102697")
+
+#Convert to regular long/lat degrees (EPSG 4326) -- now geometry will look like regular coordinates
+cpd_sf <- st_transform(cpd_sf, crs = 4326)
+
+#Split geometry into separate long/lat columns -- for mapping later
+cpd_sf <- cpd_sf %>%
+    mutate(lon = unlist(map(cpd_sf$geometry,1)),
+           lat = unlist(map(cpd_sf$geometry,2)))
+
+```
+
+```{r}
+#Import census data
+
+#Using 2020 5-year data because it's more stable, and I couldn't get it to work for 2021
+acs2020_var %>% 
+  #make sure variable is available by block group
+  filter(grepl("Median household income", label) & geography == "block group")
+
+#Median household income in last 12 months (2020 inflation-adjusted dollars)
+mo_income <- get_acs(geography = "block group",
+              variables = c(median_income = "B19013_001"),
+              state = "MO",
+              year = 2020,
+              #Include block group geometry
+              geometry = T) 
+
+#Total population
+mo_pop <- get_acs(geography = "block group",
+              variables = c(population = "B01001_001"),
+              state = "MO",
+              year = 2020)
+
+#Join together
+census_df <- mo_income %>% 
+  full_join(mo_pop, by = "GEOID") %>% 
+  rename("block_group" = NAME.x,
+         "median_income" = estimate.x,
+         "income_moe" = moe.x,
+         "population" = estimate.y,
+         "pop_moe" = moe.y) %>% 
+  select(-c(variable.x, variable.y, NAME.y))
+
+#Set crs to the same as cpd_sf
+st_crs(census_df)#Currently in EPSG 4269
+census_df <- st_transform(census_df, crs = 4326)
+
+#Join to cpd_sf -- place each lon/lat point into its appropriate block group, so we can see median household income for that area
+cpd_sf <- st_join(cpd_sf, census_df, join = st_within) 
+```
+
+```{r}
+#Check: Any NAs? -- none 
+cpd_sf %>% filter(is.na("NAME"))
+cpd_sf %>% filter(is.na("geometry"))
+
+#Set df as tibble so that code will run faster -- geometry slows everything down and since I did the join, I really don't need it anymore
+cpd_sf <- as.tibble(cpd_sf)
+
+
+#Look for any pattern with number of calls/patrols and median household income of block group (adjust for population of block group)
+cpd_sf %>% 
+  group_by(block_group, median_income, population) %>% 
+  summarise(total_calls = n()) %>% 
+  #Calculate rate per 100 people
+  mutate(calls_per_100 = total_calls/population*100) %>% 
+  arrange(desc(calls_per_100)) %>% 
+#Make a basic scatter plot with ggplot
+  ggplot(aes(x=median_income, y=calls_per_100)) + 
+  geom_point() +
+  labs(title = "Correlation between median income and police patrols and calls")
+
+```
+
+
+```{r}
+#Clean it up and add record type, so we can give the points different colors based on types of calls in each area
+cpd_sf %>% 
+  group_by(block_group, median_income, population, record_type) %>% 
+  summarise(total = n()) %>% 
+  mutate(calls_per_100 = total/population*100) %>% 
+  ggplot(aes(x=median_income, y=calls_per_100, color = record_type)) + 
+  geom_point() +
+  scale_x_continuous(labels=scales::dollar_format()) +
+  scale_y_continuous(labels=scales::number_format()) +
+  theme_light() +
+  #Adjusting y-axis because of how crowded it is toward the bottom
+  coord_cartesian(ylim = c(0, 200)) +
+  xlab("Median household income in the last year (2020 inflation-adjusted dollars)") +
+  ylab("Number of calls or patrols logged per 100 people") +
+  labs(title = "Correlation between median income and police patrols and calls")
+```
+
+```{r}
+#Same as above, but only looking at calls/patrols where reports were filed
+cpd_sf %>% 
+  filter(!is.na(report)) %>% 
+  group_by(block_group, median_income, population, record_type) %>% 
+  summarise(total = n()) %>% 
+  mutate(calls_per_100 = total/population*100) %>% 
+  ggplot(aes(x=median_income, y=calls_per_100, color = record_type)) + 
+  geom_point() +
+  scale_x_continuous(labels=scales::dollar_format()) +
+  scale_y_continuous(labels=scales::number_format()) +
+  coord_cartesian(ylim = c(0, 75)) +
+  theme_light() +
+  xlab("Median household income in the last year (2020 inflation-adjusted dollars)") +
+  ylab("Number of reports filed per 100 people") +
+  labs(title = "Correlation between median income and police reports filed")
+```
+
+```{r}
+#The above charts seem to indicate fewer calls/patrols occur in higher-income neighborhoods. I'm going to try to find an exact number to make sure.
+
+#Count how many calls/patrols/traffic occur in neighborhoods under $50k, $50k-$75k, $75k-$100k, $100k-$150k, over $150k median income (this is arbitrary, I could probably break this into many more buckets)
+cpd_sf <- cpd_sf %>% 
+  mutate(income_range = median_income,
+         income_range = ifelse(median_income <= 50000, "$50,000 or under", income_range),
+         income_range = ifelse(median_income > 50000 & median_income <= 75000, "$50,001 - $75,000", income_range),
+         income_range = ifelse(median_income > 75000 & median_income <= 100000, "$75,001-$100,000", income_range),
+         income_range = ifelse(median_income > 100000 & median_income <= 150000, "$100,001-$150,000", income_range),
+         income_range = ifelse(median_income >= 150000, "More than $150,000", income_range)) 
+
+#Calculate total population living in each income range -- doing this in two steps
+income_range_pop_1 <- cpd_sf %>% 
+  group_by(income_range, block_group, population) %>% 
+  summarise(total_calls = n())
+
+income_range_pop_2 <- income_range_pop_1 %>% 
+  group_by(income_range) %>% 
+  summarise(sum_pop = sum(population), total_calls = sum(total_calls)) %>% 
+  mutate(calls_per_100 = total_calls/sum_pop*100)
+
+#Make a basic bar graph 
+income_range_pop_2 %>% 
+  mutate(income_range = fct_relevel(income_range, "$50,000 or under", "$50,001 - $75,000", "$75,001-$100,000", "$100,001-$150,000", "More than $150,000", "NA")) %>% 
+  ggplot(aes(x=income_range, y = calls_per_100)) +
+  geom_col() +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) +
+  scale_y_continuous(labels=scales::number_format()) +
+  xlab("Median household income in the last year (2020 inflation adjusted)") +
+  ylab("Number of calls or patrols logged per 100 people") +
+  labs(title = "Number of 911 calls and patrols by income range")
+
+```
+
+
